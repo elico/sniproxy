@@ -28,8 +28,10 @@ func (fr forwardRules) GetN(uri string, port int) string {
 }
 
 type conf struct {
-	Timeout      int
-	Listen       []int
-	Default      string
-	ForwardRules forwardRules `yaml:"forward_rules"`
+	Timeout          int
+	Listen           []int
+	Default          string
+	BlockDestination string       `yaml:"block_forward_destination"`
+	ForwardRules     forwardRules `yaml:"forward_rules"`
+	SpliceNonSni     int          `yaml:"splice_non_sni"`
 }

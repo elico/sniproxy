@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -9,14 +10,76 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
+	"github.com/elico/dns_resolver"
 	glog "github.com/fangdingjun/go-log/v5"
 	proxyproto "github.com/pires/go-proxyproto"
 	yaml "gopkg.in/yaml.v2"
 )
+
+type sockaddr struct {
+	family uint16
+	data   [14]byte
+}
+
+var openDNSResolver *dns_resolver.DnsResolver
+
+const SO_ORIGINAL_DST = 80
+
+// realServerAddress returns an intercepted connection's original destination.
+func realServerAddress(conn *net.Conn) (string, error) {
+	tcpConn, ok := (*conn).(*net.TCPConn)
+	if !ok {
+		return "", errors.New("not a TCPConn")
+	}
+
+	file, err := tcpConn.File()
+	if err != nil {
+		return "", err
+	}
+
+	// To avoid potential problems from making the socket non-blocking.
+	tcpConn.Close()
+	*conn, err = net.FileConn(file)
+	if err != nil {
+		return "", err
+	}
+
+	defer file.Close()
+	fd := file.Fd()
+
+	var addr sockaddr
+	size := uint32(unsafe.Sizeof(addr))
+	err = getsockopt(int(fd), syscall.SOL_IP, SO_ORIGINAL_DST, uintptr(unsafe.Pointer(&addr)), &size)
+	if err != nil {
+		return "", err
+	}
+
+	var ip net.IP
+	switch addr.family {
+	case syscall.AF_INET:
+		ip = addr.data[2:6]
+	default:
+		return "", errors.New("unrecognized address family")
+	}
+
+	port := int(addr.data[0])<<8 + int(addr.data[1])
+
+	return net.JoinHostPort(ip.String(), strconv.Itoa(port)), nil
+}
+
+func getsockopt(s int, level int, name int, val uintptr, vallen *uint32) (err error) {
+	_, _, e1 := syscall.Syscall6(syscall.SYS_GETSOCKOPT, uintptr(s), uintptr(level), uintptr(name), uintptr(val), uintptr(unsafe.Pointer(vallen)), 0)
+	if e1 != 0 {
+		err = e1
+	}
+	return
+}
 
 func getSNIServerName(buf []byte) string {
 	n := len(buf)
@@ -151,17 +214,58 @@ func serve(ctx context.Context, c net.Conn) {
 		glog.Error(err)
 		return
 	}
+
 	servername := getSNIServerName(buf[:n])
 	if servername == "" {
 		glog.Debugf("no sni, send to default")
+		// Verify that the connection is intercepted
+		address, err := realServerAddress(&c)
+		// need to verify here that there is no internal loop
+		// We should know here what IP addresses present on the Machine/Device
+		if err == nil && address != c.LocalAddr().String() {
+			if cfg.SpliceNonSni > 0 {
+				glog.Debugf("Splicing default dst %s", address)
+				forward(ctx, c, buf[:n], address)
+				return
+			}
+		}
+		glog.Debugf("Connecting %s->%s to default dst %s", c.LocalAddr(), c.RemoteAddr())
 		forward(ctx, c, buf[:n], getDefaultDST())
 		return
 	}
+
+	blackListed := false
+
+	ips, err := openDNSResolver.LookupHost(servername)
+	if err != nil {
+		glog.Debugf("Could not get IPs: %v\n", err)
+		switch {
+		case strings.Contains(err.Error(), "NXDOMAIN"):
+			//it's fine and possible
+		default:
+			glog.Debugf("openDNSResolver Got error on lookup for", servername, "ERROR:", err)
+		}
+	} else {
+		for _, ip := range ips {
+			if ip.String() == "146.112.61.104" {
+				blackListed = true
+				break
+			}
+		}
+	}
+
+	if blackListed {
+		glog.Debugf("use dst %s for sni %s", cfg.BlockDestination, servername)
+		forward(ctx, c, buf[:n], cfg.BlockDestination)
+		return
+	}
+
 	dst := getDST(c, servername)
 	if dst == "" {
 		dst = getDefaultDST()
-		glog.Debugf("use default dst %s for sni %s", dst, servername)
+		glog.Debugf("using default dst %s for sni %s", dst, servername)
 	}
+	glog.Debugf("using dst %s for sni %s", dst, servername)
 	forward(ctx, c, buf[:n], dst)
 }
 
@@ -175,6 +279,8 @@ func main() {
 	flag.StringVar(&logfile, "log_file", "", "log file")
 	flag.StringVar(&loglevel, "log_level", "INFO", "log level")
 	flag.Parse()
+
+	openDNSResolver = dns_resolver.NewWithPort([]string{"208.67.222.222", "208.67.220.220"}, "53")
 
 	data, err := ioutil.ReadFile(cfgfile)
 	if err != nil {

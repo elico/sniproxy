@@ -8,6 +8,10 @@
 # or parse TLS HELLO message failed
 default: 127.0.0.1:8443
 
+# https://support.opendns.com/hc/en-us/articles/227986927-What-are-the-Cisco-Umbrella-Block-Page-IP-Addresses-
+block_forward_destination:  146.112.61.104:443
+splice_non_sni: 1
+
 # the port listen on
 # can specify multiple ports
 listen:
